@@ -10,8 +10,13 @@ import org.ps5jb.sdk.core.kernel.KernelPointer;
 import org.ps5jb.sdk.lib.LibKernel;
 
 import java.io.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public class Elfloader implements Runnable {
+    // الثوابت الموجودة مسبقًا
     private static final int OFF_EHDR_TYPE  = 0x10;
     private static final int OFF_EHDR_ENTRY = 0x18;
     private static final int OFF_EHDR_PHOFF = 0x20;
@@ -48,6 +53,8 @@ public class Elfloader implements Runnable {
     private static final int SHT_RELA = 4;
 
     private static final int R_X86_64_RELATIVE = 8;
+    private static final int R_X86_64_GLOB_DAT = 6;  // جديد: لدعم الربط الديناميكي
+    private static final int R_X86_64_JUMP_SLOT = 7; // جديد: لدعم الربط الديناميكي
 
     private static final int PF_X = 0x1;
     private static final int PF_W = 0x2;
@@ -63,6 +70,16 @@ public class Elfloader implements Runnable {
     private static final int MAP_FIXED     = 0x10;
     private static final int MAP_ANONYMOUS = 0x1000;
 
+    // أنواع Dynamic Table
+    private static final long DT_NULL = 0x00;
+    private static final long DT_NEEDED = 0x01;
+    private static final long DT_RELA = 0x07;
+    private static final long DT_RELASZ = 0x08;
+    private static final long DT_RELAENT = 0x09;
+    private static final long DT_STRTAB = 0x05;
+    private static final long DT_SYMTAB = 0x06;
+    private static final long DT_SYMENT = 0x0b;
+
     private static Pointer arg_addr;
 
     private KernelPointer qaFlags;
@@ -73,6 +90,9 @@ public class Elfloader implements Runnable {
     private SdkInit sdk;
     private LibKernel libKernel;
     private byte[] elfData = null;
+
+    // خريطة لتخزين المكتبات المحملة
+    private Map<String, Pointer> loadedLibs = new HashMap<>();
 
     private void init() throws Exception {
         Status.println("Starting init...");
@@ -135,16 +155,16 @@ public class Elfloader implements Runnable {
                     return;
                 }
 
-                Status.println("Searching for bdj.elf on USB...");
+                Status.println("Searching for elfldr.elf on USB..."); // تغيير من bdj.elf إلى elfldr.elf
                 for (int i = 0; i < 8; i++) {
                     try {
-                        File f = new File("/mnt/usb" + i + "/bdj.elf");
+                        File f = new File("/mnt/usb" + i + "/elfldr.elf");
                         if (f.exists()) {
                             elfFile = f;
-                            Status.println("Found bdj.elf on usb" + i);
+                            Status.println("Found elfldr.elf on usb" + i);
                             break;
                         } else {
-                            Status.println("No bdj.elf on usb" + i);
+                            Status.println("No elfldr.elf on usb" + i);
                         }
                     } catch (Exception ex) {
                         Status.println("Error searching usb" + i + ": " + ex.getMessage());
@@ -189,14 +209,14 @@ public class Elfloader implements Runnable {
             }
 
             if (elfFile == null) {
-                Status.println("No bdj.elf found! Aborting.");
+                Status.println("No elfldr.elf found! Aborting.");
                 return;
             }
 
-            Status.println("Reading bdj.elf...");
+            Status.println("Reading elfldr.elf...");
             this.elfData = new byte[(int) elfFile.length()];
             int read = new FileInputStream(elfFile).read(this.elfData);
-            Status.println("# bytes of bdj.elf read: " + read);
+            Status.println("# bytes of elfldr.elf read: " + read);
 
             File procDumpBeforeSetup = new File(elfFile.getParentFile(), "before_setup.procdump");
             if (procDumpBeforeSetup.exists()) {
@@ -402,6 +422,50 @@ public class Elfloader implements Runnable {
         }
     }
 
+    // دالة مساعدة لقراءة السلاسل (Strings) من جدول السلاسل
+    private String readString(Pointer ptr, long offset) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; ; i++) {
+            byte b = (byte) ptr.inc(offset + i).read1();
+            if (b == 0) break;
+            sb.append((char) b);
+        }
+        return sb.toString();
+    }
+
+    // دالة لتحميل مكتبة ديناميكية
+    private Pointer loadLibrary(String libName) throws Exception {
+        String libPath = "/system/common/lib/" + libName;
+        File libFile = new File(libPath);
+        if (!libFile.exists()) {
+            throw new Exception("Library not found: " + libPath);
+        }
+        byte[] libData = new byte[(int) libFile.length()];
+        new FileInputStream(libFile).read(libData);
+        Pointer libAddr = Pointer.calloc(libData.length);
+        for (int i = 0; i < libData.length; i++) {
+            libAddr.inc(i).write1(libData[i]);
+        }
+        Status.println("Loaded library " + libName + " at " + libAddr.addr());
+        return libAddr;
+    }
+
+    // دالة لحل الرموز (افتراضية، تحتاج تنفيذًا أكثر دقة)
+    private long resolveSymbol(String symName, Map<String, Pointer> loadedLibs) throws Exception {
+        Status.println("Resolving symbol: " + symName);
+        // استخدام sceKernelDlsym للبحث عن الرمز
+        Pointer handle = Pointer.valueOf(0x2001); // Handle لـ libkernel
+        Pointer symAddr = Pointer.calloc(8);
+        int ret = libKernel.sceKernelDlsym(handle, symName, symAddr.addr());
+        if (ret != 0) {
+            throw new Exception("sceKernelDlsym failed for symbol " + symName + ": " + ret);
+        }
+        long addr = symAddr.read8();
+        symAddr.free();
+        Status.println("Symbol " + symName + " resolved at " + addr);
+        return addr;
+    }
+
     public void runElf(byte[] elf_bytes, OutputStream os) throws Exception {
         Pointer elf_addr = Pointer.NULL;
         Pointer base_addr = Pointer.NULL;
@@ -465,6 +529,8 @@ public class Elfloader implements Runnable {
                 throw new Exception("runElf: mmap failed");
             }
             Status.println("Parsing program headers...");
+            long dynamic_addr = 0;
+            long dynamic_size = 0;
             for (int i = 0; i < e_phnum; i++) {
                 Pointer phdr_addr = elf_addr.inc(e_phoff).inc(i * SIZE_PHDR);
                 int p_type = phdr_addr.inc(OFF_PHDR_TYPE).read4();
@@ -476,6 +542,55 @@ public class Elfloader implements Runnable {
                 } else if (p_type == PT_DYNAMIC) {
                     Status.println("Processing PT_DYNAMIC for PHDR " + i);
                     pt_dynamic(elf_addr, base_addr, phdr_addr);
+                    dynamic_addr = base_addr.inc(phdr_addr.inc(OFF_PHDR_VADDR).read8()).addr();
+                    dynamic_size = phdr_addr.inc(OFF_PHDR_MEMSZ).read8();
+                }
+            }
+            // تحليل قسم PT_DYNAMIC لتحميل المكتبات
+            List<String> neededLibs = new ArrayList<>();
+            long strtab_addr = 0, symtab_addr = 0, syment = 0, rela_addr = 0, rela_size = 0, rela_ent = 0;
+            if (dynamic_addr != 0) {
+                Status.println("Parsing dynamic section at " + dynamic_addr + ", size=" + dynamic_size);
+                for (long i = 0; i < dynamic_size; i += 16) { // Elf64_Dyn size = 16 bytes
+                    long d_tag = Pointer.valueOf(dynamic_addr + i).read8();
+                    long d_val = Pointer.valueOf(dynamic_addr + i + 8).read8();
+                    if (d_tag == DT_NEEDED) {
+                        String libName = readString(Pointer.valueOf(dynamic_addr), strtab_addr + d_val);
+                        neededLibs.add(libName);
+                        Status.println("Found DT_NEEDED: " + libName);
+                    } else if (d_tag == DT_RELA) {
+                        rela_addr = base_addr.inc(d_val).addr();
+                        Status.println("Found DT_RELA: " + rela_addr);
+                    } else if (d_tag == DT_RELASZ) {
+                        rela_size = d_val;
+                        Status.println("Found DT_RELASZ: " + rela_size);
+                    } else if (d_tag == DT_RELAENT) {
+                        rela_ent = d_val;
+                        Status.println("Found DT_RELAENT: " + rela_ent);
+                    } else if (d_tag == DT_STRTAB) {
+                        strtab_addr = base_addr.inc(d_val).addr();
+                        Status.println("Found DT_STRTAB: " + strtab_addr);
+                    } else if (d_tag == DT_SYMTAB) {
+                        symtab_addr = base_addr.inc(d_val).addr();
+                        Status.println("Found DT_SYMTAB: " + symtab_addr);
+                    } else if (d_tag == DT_SYMENT) {
+                        syment = d_val;
+                        Status.println("Found DT_SYMENT: " + syment);
+                    } else if (d_tag == DT_NULL) {
+                        Status.println("Reached DT_NULL, ending dynamic section parse");
+                        break;
+                    }
+                }
+                // تحميل المكتبات المطلوبة
+                for (String libName : neededLibs) {
+                    if (!loadedLibs.containsKey(libName)) {
+                        Pointer libAddr = loadLibrary(libName);
+                        loadedLibs.put(libName, libAddr);
+                        // كرر تحميل المكتبة كملف ELF
+                        byte[] libData = new byte[(int) new File("/system/common/lib/" + libName).length()];
+                        new FileInputStream("/system/common/lib/" + libName).read(libData);
+                        runElf(libData, os);
+                    }
                 }
             }
             Status.println("Applying relocations...");
@@ -495,12 +610,22 @@ public class Elfloader implements Runnable {
                 for (int j = 0; j < rela_count; j++) {
                     Pointer rela_addr = elf_addr.inc(sh_offset).inc(SIZE_RELA * j);
                     long r_info = rela_addr.inc(OFF_RELA_INFO).read8();
-                    Status.println("RELA " + j + ": info=" + r_info);
-                    if (r_info == R_X86_64_RELATIVE) {
+                    long r_offset = rela_addr.inc(OFF_RELA_OFFSET).read8();
+                    long r_addend = rela_addr.inc(OFF_RELA_ADDEND).read8();
+                    int reloc_type = (int) (r_info & 0xFF);
+                    Status.println("RELA " + j + ": info=" + r_info + ", type=" + reloc_type);
+                    if (reloc_type == R_X86_64_RELATIVE) {
                         r_relative(base_addr, rela_addr);
                         Status.println("R_X86_64_RELATIVE applied for RELA " + j);
+                    } else if (reloc_type == R_X86_64_GLOB_DAT || reloc_type == R_X86_64_JUMP_SLOT) {
+                        int sym_idx = (int) (r_info >> 32);
+                        Pointer sym_addr = Pointer.valueOf(symtab_addr).inc(sym_idx * syment);
+                        String sym_name = readString(Pointer.valueOf(symtab_addr), sym_addr.inc(4).read4());
+                        long sym_value = resolveSymbol(sym_name, loadedLibs);
+                        base_addr.inc(r_offset).write8(sym_value);
+                        Status.println("Applied " + (reloc_type == R_X86_64_GLOB_DAT ? "R_X86_64_GLOB_DAT" : "R_X86_64_JUMP_SLOT") + " for symbol " + sym_name + " at " + base_addr.inc(r_offset).addr());
                     } else {
-                        Status.println("Unsupported relocation type: " + r_info + ", skipping");
+                        Status.println("Unsupported relocation type: " + reloc_type + ", skipping");
                     }
                 }
             }
